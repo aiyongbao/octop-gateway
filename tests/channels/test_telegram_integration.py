@@ -333,7 +333,8 @@ async def test_real_sdk_album_retry_preserves_multipart_bytes(handles):
     async with HTTPXRequest() as transport:
         bot = Bot("123456:fake-token", request=transport)
         with (
-            patch.object(transport, "do_request", side_effect=consume),
+            # HTTPXRequest uses slots, so patch the class rather than a read-only instance.
+            patch.object(HTTPXRequest, "do_request", side_effect=consume),
             patch("octop_gateway.channels.telegram.delivery.asyncio.sleep", new_callable=AsyncMock),
             pytest.raises(RetryAfter),
         ):

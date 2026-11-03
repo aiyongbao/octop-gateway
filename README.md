@@ -92,6 +92,55 @@ Use a Bot Token and enable Message Content Intent in the developer portal. `allo
 #### Custom channels
 Subclass `BaseChannel`, register it with `ChannelManager.add_channel(...)`, and the rest of the pipeline (media, constraints, push) works unchanged.
 
+#### Feishu response cards
+
+Feishu inbound responses use one shared, updating card by default. Public business steps and the current action
+stay visible while technical activity is folded into a secondary section. Updates
+are coalesced to at most one per second; idle cards refresh every ten seconds
+with the elapsed time and age of the last observed event. These are observation
+times, not exact model or tool execution timings. One muted line beneath the
+active step shows the latest public business note or real tool event, replacing
+the previous line. Step changes discard stale hints; command execution is never
+inferred to mean code writing or business completion. A packaged GIF rotates in
+the client every 0.8 seconds without model queries or frequent message patches.
+It is uploaded once per channel with a two-second bound; failure falls back to a
+static indicator without breaking delivery.
+The active-step duration and last observed activity remain visible; unchanged
+plans/transport keepalives do not reset the activity clock. Completion, failure,
+and cancellation remove the indicator.
+
+Cards use Feishu JSON 2.0 (client 7.20+) and the existing application message
+create/update APIs. Native collapsible panels do not require a callback server.
+Files and images remain native messages. Long answers are delivered completely
+in bounded post messages; the card is only a preview during generation. Card
+creation/update failure falls back to final text without rerunning the processor.
+After fallback text delivery, a compact terminal update closes the original
+card without resubmitting rejected model content. A failed post is labeled as
+undelivered; unfinished business steps stay unconfirmed. If the platform also
+rejects the minimal update, the failure is logged without rerunning the task.
+Set `FeishuConfig(streaming_cards=False, ...)` for legacy delivery.
+
+`show_tool_hints` and `show_thinking` still apply. Tool arguments/results appear
+only when the processor provides `arguments` and `output`/`result` metadata.
+Common credential fields are redacted and details are excerpted. Name-only
+`TOOL_END` events are labeled **returned**, not successful.
+
+Business-step mode consumes explicit successful `write_todos` updates published
+as optional `TYPING.metadata.task_progress` events (version 1, source
+`write_todos`, steps with `title` and `pending`/`in_progress`/`completed` status).
+It requires the matching Octop stream projection and Feishu-only public-progress
+middleware. The middleware uses the existing plan tool; no business skill or
+platform template is required. Model compliance still matters: if no plan is
+published, the card says that business steps have not been synchronized. Ordinary
+tool events, elapsed time, and response completion never complete pending steps.
+Public explanations are separate from the optional thinking display. Basic
+answer/tool cards still work with older producers without these additions.
+
+Current limitation: the model may report later phases together after doing the
+work. A successful intermediate plan write does not prove timely client display;
+acceptance must also check event forwarding, card update receipts and the client.
+The renderer does not manufacture intermediate stages with timers or replay.
+
 #### Constraints, media & push
 - **Constraints** — rate limit, response timeout, and typing indicator per channel.
 - **Media** — pluggable `MediaBackend`; persist attachments wherever you like.
