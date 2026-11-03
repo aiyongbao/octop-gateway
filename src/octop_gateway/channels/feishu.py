@@ -7,6 +7,7 @@ sending. Supports text, images, and file messages in both DM and group chats.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -14,13 +15,15 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from importlib.resources import files
 from typing import Any
 from urllib.parse import quote
 
 import aiohttp
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.channels.feishu_cards import FeishuCardReply, FeishuCardState
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -64,12 +67,15 @@ class FeishuConfig(ChannelConfig):
         encrypt_key: Event encryption key (for HTTP event callbacks).
         channel_id: Optional explicit channel ID; auto-generated UUID if omitted.
         tenant_id: Optional tenant identifier for multi-tenant deployments.
+        streaming_cards: Keep each inbound response in one updating card. Set
+            False to retain the legacy post-per-event delivery.
     """
 
     app_id: str = ""
     app_secret: str = ""
     verification_token: str = ""
     encrypt_key: str = ""
+    streaming_cards: bool = True
 
     required_credentials = ("app_id", "app_secret")
 
@@ -106,6 +112,9 @@ class FeishuChannel(BaseChannel):
         self._tenant_token: str = ""
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
+        self._progress_image_lock = asyncio.Lock()
+        self._progress_image_attempted = False
+        self._progress_image_key = ""
         self._ws_client: Any = None
         self._ws_thread: Any = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
@@ -607,6 +616,94 @@ class FeishuChannel(BaseChannel):
         alias_subject_fields(out, str(out.get("chat_id") or "") or subject.subject_id, "to_handle")
         return out
 
+    async def _process_inbound(self, message: InboundMessage, subject: ChannelSubject) -> bool:
+        """Render this response in one card, preserving shared inbound policy."""
+        if not self._config.streaming_cards:
+            return await super()._process_inbound(message, subject)
+
+        # The manager refreshes registered subjects when later messages arrive.
+        # Pin the reply target to this turn, including its originating topic.
+        subject = replace(subject, metadata=dict(subject.metadata))
+
+        # Partial updates belong to the same logical message; the card loop
+        # coalesces them to at most one PATCH per second per response.
+        await self._acquire_rate_slot()
+
+        async def send_text(text: str) -> None:
+            await self._acquire_rate_slot()
+            data = await self._deliver(
+                subject, msg_type="post", content=json.dumps(self._build_post_content(text), ensure_ascii=False)
+            )
+            if data.get("code") != 0:
+                raise RuntimeError("Feishu response text delivery failed")
+
+        async def send_media(media: ContentPart) -> None:
+            await self._acquire_rate_slot()
+            await self._send_media(subject, media)
+
+        state = FeishuCardState(
+            show_tools=self._constraints.show_tool_hints,
+            show_thinking=self._constraints.show_thinking,
+            goal=(message.text or "").strip().splitlines()[0] if (message.text or "").strip() else "",
+        )
+
+        async def create(card: dict[str, Any]) -> str:
+            state.loading_image_key = await self._get_progress_image_key()
+            return await self._send_progress_card(subject, state.render(self._clean_output))
+
+        reply = FeishuCardReply(
+            state,
+            create=create,
+            update=self._update_progress_card,
+            send_text=send_text,
+            send_media=send_media,
+            clean=self._clean_output,
+        )
+        return await reply.run(self._processor(message))
+
+    async def _get_progress_image_key(self) -> str:
+        """Upload a packaged animation once per app/channel, with a safe fallback."""
+        async with self._progress_image_lock:
+            if self._progress_image_attempted:
+                return self._progress_image_key
+            self._progress_image_attempted = True
+            try:
+                async with asyncio.timeout(2.0):
+                    asset = files("octop_gateway").joinpath("assets", "feishu-loading.gif")
+                    data = await asyncio.to_thread(asset.read_bytes)
+                    self._progress_image_key = await self._upload_image_to_feishu(
+                        ImageContent(data=base64.b64encode(data).decode("ascii"), mime_type="image/gif")
+                    )
+            except Exception:
+                # Missing upload permission or a slow API must not fail the reply.
+                logger.warning("Feishu progress animation unavailable; using a static indicator")
+            return self._progress_image_key
+
+    async def _send_progress_card(self, subject: ChannelSubject, card: dict[str, Any]) -> str:
+        """Create a shared card and retain its platform-issued message ID."""
+        data = await self._deliver(subject, msg_type="interactive", content=json.dumps(card, ensure_ascii=False))
+        message_id = str((data.get("data") or {}).get("message_id") or "")
+        if data.get("code") != 0 or not message_id:
+            raise RuntimeError("Feishu progress card creation failed")
+        return message_id
+
+    async def _update_progress_card(self, message_id: str, card: dict[str, Any]) -> None:
+        """Update this application's shared card without sending another bubble."""
+        http = await self._ensure_http()
+        headers = await self._get_auth_headers()
+        url = f"{_API_BASE}/im/v1/messages/{quote(message_id, safe='')}"
+        async with http.patch(url, headers=headers, json={"content": json.dumps(card, ensure_ascii=False)}) as resp:
+            data = await resp.json()
+        if data.get("code") != 0:
+            # Retain numeric schema diagnostics without logging card text or
+            # the API message, which can echo private user/model content.
+            inner = re.search(r"\bErrCode\s*[:=]\s*(\d+)", str(data.get("msg") or ""), re.IGNORECASE)
+            size = len(json.dumps(card, ensure_ascii=False).encode("utf-8"))
+            raise RuntimeError(
+                f"Feishu progress card update failed (code={data.get('code')}, "
+                f"schema_code={inner.group(1) if inner else 'unknown'}, card_bytes={size})"
+            )
+
     async def _send_text(self, subject: ChannelSubject, text: str) -> None:
         """Send a message to Feishu as a 'post' with markdown support.
 
@@ -698,7 +795,7 @@ class FeishuChannel(BaseChannel):
             elif getattr(media, "local_path", None):
                 await self._send_text(subject, f"[{label} (local upload failed)]")
 
-    async def _deliver(self, subject: ChannelSubject, *, msg_type: str, content: str) -> None:
+    async def _deliver(self, subject: ChannelSubject, *, msg_type: str, content: str) -> dict[str, Any]:
         """Route one outbound message, staying inside the originating thread.
 
         Messages that arrived in a Feishu thread are answered with the reply
@@ -713,7 +810,7 @@ class FeishuChannel(BaseChannel):
         if thread_id and reply_to:
             data = await self._reply_message(reply_to, msg_type=msg_type, content=content)
             if data.get("code") == 0:
-                return
+                return data
             logger.warning(
                 "Feishu thread reply failed (code=%s), falling back to chat send: thread=%s",
                 data.get("code"),
@@ -721,7 +818,7 @@ class FeishuChannel(BaseChannel):
             )
 
         receive_id = str(meta.get("to_handle") or "") or subject.subject_id
-        await self._send_message(
+        return await self._send_message(
             receive_id=receive_id,
             receive_id_type=self._resolve_receive_id_type(receive_id, meta),
             msg_type=msg_type,
@@ -833,7 +930,7 @@ class FeishuChannel(BaseChannel):
             fields={"image_type": "message"},
             file_field="image",
             file_data=data,
-            filename="image.png",
+            filename="image.gif" if mime == "image/gif" else "image.png",
             content_type=mime or "image/png",
         )
 

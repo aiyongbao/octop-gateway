@@ -24,7 +24,7 @@ TIMEOUT_ERROR = "请求超时，请稍后重试。"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", [*sorted(SUPPORTED_CHANNEL_KINDS), "qq-stream"])
+@pytest.mark.parametrize("kind", [*sorted(SUPPORTED_CHANNEL_KINDS), "qq-stream", "feishu-legacy"])
 @pytest.mark.parametrize("partial", [False, True], ids=["before-output", "after-partial-output"])
 @pytest.mark.parametrize("mode", ["auth", "timeout"])
 @pytest.mark.parametrize("ending", ["completed", "eof", "hang", "cleanup-hang"])
@@ -36,7 +36,8 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
     tail_entered = False
     keepalives: list[TypingKeepalive] = []
     streaming = kind == "qq-stream"
-    kind = kind.removesuffix("-stream")
+    legacy_feishu = kind == "feishu-legacy"
+    kind = kind.removesuffix("-stream").removesuffix("-legacy")
     error = ERROR if mode == "auth" else TIMEOUT_ERROR
 
     async def processor(_message: InboundMessage) -> AsyncIterator[MessageEvent]:
@@ -78,6 +79,7 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
             "show_thinking": False,
             "show_tool_hints": False,
             "show_typing": False,
+            "streaming_cards": not legacy_feishu,
         }
     )
     channel = _load_channel(kind)(
@@ -120,6 +122,7 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
     ws = MagicMock(reply_stream=AsyncMock())
     frames: list[Any] = []
     a2a = AsyncMock()
+    cards = AsyncMock()
     if kind == "wecom":
         channel._ws_client = ws
         message.metadata.update({"_ws_client": ws, "_frame": {"body": {}}})
@@ -133,6 +136,10 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
     elif kind == "xiaoyi":
         channel._connected = True
         monkeypatch.setattr(channel, "_send_to_session", a2a)
+    elif kind == "feishu" and not legacy_feishu:
+        monkeypatch.setattr(channel, "_get_progress_image_key", AsyncMock(return_value=""))
+        monkeypatch.setattr(channel, "_send_progress_card", AsyncMock(return_value="om_card"))
+        monkeypatch.setattr(channel, "_update_progress_card", cards)
 
     monkeypatch.setattr("octop_gateway.utils.STREAM_CLOSE_TIMEOUT", 0.02, raising=False)
     await asyncio.wait_for(channel.handle_inbound(message), timeout=0.5)
@@ -144,6 +151,9 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
         assert any(error in json.dumps(result, ensure_ascii=False) for result in wire)
         assert [result["status"]["state"] for result in wire if result["kind"] == "status-update"] == ["failed"]
         assert wire[-1]["final"] is True
+    elif kind == "feishu" and not legacy_feishu:
+        assert error in json.dumps(cards.await_args.args[1], ensure_ascii=False)
+        assert cards.await_args.args[1]["header"]["template"] == "red"
     else:
         assert sent.await_args.args[1] == error
     if kind != "wecom":
@@ -165,6 +175,9 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
         assert [result["status"]["state"] for result in wire if result["kind"] == "status-update"][-1] == "completed"
     elif kind == "qq" and frames:
         assert "恢复成功" in str(frames[-1])
+    elif kind == "feishu" and not legacy_feishu:
+        assert "恢复成功" in json.dumps(cards.await_args.args[1], ensure_ascii=False)
+        assert cards.await_args.args[1]["header"]["template"] == "green"
     else:
         assert "恢复成功" in sent.await_args.args[1]
     if kind != "wecom":
